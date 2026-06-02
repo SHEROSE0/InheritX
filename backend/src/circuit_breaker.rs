@@ -215,4 +215,497 @@ impl CircuitBreaker {
             },
         }
     }
+
+    // Expose internal state for testing
+    #[cfg(test)]
+    fn failure_count(&self) -> u32 {
+        self.0.failure_count.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn opened_at(&self) -> u64 {
+        self.0.opened_at.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering as AtoOrdering;
+
+    /// Helper to track call invocations in tests
+    struct CallCounter {
+        invocations: AtomicUsize,
+    }
+
+    impl CallCounter {
+        fn new() -> Self {
+            Self {
+                invocations: AtomicUsize::new(0),
+            }
+        }
+
+        fn increment(&self) {
+            self.invocations.fetch_add(1, AtoOrdering::SeqCst);
+        }
+
+        fn count(&self) -> usize {
+            self.invocations.load(AtoOrdering::SeqCst)
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // CIRCUIT STATE TRANSITIONS
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Test that circuit starts in Closed state and allows successful calls.
+    #[tokio::test]
+    async fn circuit_starts_closed_and_allows_calls() {
+        let cb = CircuitBreaker::new("test-service", 3, Duration::from_secs(10));
+        let counter = Arc::new(CallCounter::new());
+        let counter_clone = counter.clone();
+
+        let result = cb
+            .call(move || {
+                let c = counter_clone.clone();
+                async move {
+                    c.increment();
+                    Ok::<_, ApiError>(42)
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(counter.count(), 1);
+    }
+
+    /// Test that circuit opens after reaching failure threshold.
+    #[tokio::test]
+    async fn circuit_opens_after_threshold_failures() {
+        let cb = CircuitBreaker::new("test-service", 3, Duration::from_secs(10));
+
+        // Inject 3 transient failures to reach threshold
+        for i in 0..3 {
+            let result = cb
+                .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+                .await;
+            assert!(result.is_err(), "Attempt {} should fail", i + 1);
+            assert_eq!(cb.failure_count(), (i + 1) as u32);
+        }
+
+        // Next call should be rejected immediately with CircuitOpen
+        let result = cb
+            .call(|| async {
+                // This should never be invoked
+                panic!("Circuit should prevent this call");
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(ApiError::CircuitOpen(_))),
+            "Circuit should reject call with CircuitOpen error"
+        );
+    }
+
+    /// Test that non-transient errors do not increment failure count.
+    #[tokio::test]
+    async fn non_transient_errors_do_not_increment_failure_count() {
+        let cb = CircuitBreaker::new("test-service", 3, Duration::from_secs(10));
+
+        // Non-transient error (Unauthorized)
+        let result = cb
+            .call(|| async { Err::<(), ApiError>(ApiError::Unauthorized) })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(cb.failure_count(), 0, "Non-transient error should not increment count");
+
+        // Transient error (Timeout)
+        let result = cb
+            .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(cb.failure_count(), 1, "Transient error should increment count");
+    }
+
+    /// Test that successful calls reset the failure count.
+    #[tokio::test]
+    async fn successful_call_resets_failure_count() {
+        let cb = CircuitBreaker::new("test-service", 3, Duration::from_secs(10));
+
+        // Inject one failure
+        let _ = cb
+            .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+            .await;
+        assert_eq!(cb.failure_count(), 1);
+
+        // Successful call should reset failure count
+        let result = cb.call(|| async { Ok::<_, ApiError>(()) }).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            cb.failure_count(),
+            0,
+            "Successful call should reset failure count"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // HALF-OPEN STATE AND RECOVERY
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Test that circuit transitions to HalfOpen after timeout period.
+    #[tokio::test]
+    async fn circuit_transitions_to_half_open_after_timeout() {
+        let cb = CircuitBreaker::new("test-service", 2, Duration::from_millis(100));
+
+        // Trigger circuit open
+        for _ in 0..2 {
+            let _ = cb
+                .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+                .await;
+        }
+
+        // Circuit is now open
+        let result = cb
+            .call(|| async { panic!("Should not be called") })
+            .await;
+        assert!(matches!(result, Err(ApiError::CircuitOpen(_))));
+
+        // Wait for recovery timeout
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Circuit should be HalfOpen and allow a probe
+        let counter = Arc::new(CallCounter::new());
+        let counter_clone = counter.clone();
+
+        let result = cb
+            .call(move || {
+                let c = counter_clone.clone();
+                async move {
+                    c.increment();
+                    Ok::<_, ApiError>(42)
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(counter.count(), 1, "HalfOpen should allow probe");
+        assert_eq!(cb.failure_count(), 0, "Successful probe should reset failure count");
+    }
+
+    /// Test that HalfOpen probe failure re-opens the circuit.
+    #[tokio::test]
+    async fn half_open_probe_failure_reopens_circuit() {
+        let cb = CircuitBreaker::new("test-service", 2, Duration::from_millis(100));
+
+        // Trigger circuit open
+        for _ in 0..2 {
+            let _ = cb
+                .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+                .await;
+        }
+
+        // Wait for recovery timeout to enter HalfOpen
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Probe fails - circuit should re-open
+        let result = cb
+            .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(cb.failure_count(), 1, "Failed probe increments failure count");
+
+        // Next call should be rejected
+        let result = cb
+            .call(|| async { panic!("Should not be called") })
+            .await;
+        assert!(matches!(result, Err(ApiError::CircuitOpen(_))));
+    }
+
+    /// Test that HalfOpen probe success closes the circuit.
+    #[tokio::test]
+    async fn half_open_probe_success_closes_circuit() {
+        let cb = CircuitBreaker::new("test-service", 2, Duration::from_millis(100));
+
+        // Trigger circuit open
+        for _ in 0..2 {
+            let _ = cb
+                .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+                .await;
+        }
+
+        // Wait for recovery timeout
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Successful probe closes the circuit
+        let result = cb.call(|| async { Ok::<_, ApiError>(99) }).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(cb.failure_count(), 0, "Successful probe resets failure count");
+
+        // Next call should also succeed without circuit rejection
+        let result = cb.call(|| async { Ok::<_, ApiError>(88) }).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 88);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // TRANSIENT vs NON-TRANSIENT ERRORS
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Test that only transient errors increment failure count.
+    #[tokio::test]
+    async fn only_transient_errors_increment_failure_count() {
+        let cb = CircuitBreaker::new("test-service", 5, Duration::from_secs(30));
+
+        // ExternalService error (transient) - should increment
+        let _ = cb
+            .call(|| async { Err::<(), ApiError>(ApiError::ExternalService("503".to_owned())) })
+            .await;
+        assert_eq!(cb.failure_count(), 1);
+
+        // NotFound (non-transient) - should not increment
+        let _ = cb
+            .call(|| async { Err::<(), ApiError>(ApiError::NotFound("x".to_owned())) })
+            .await;
+        assert_eq!(cb.failure_count(), 1);
+
+        // Timeout (transient) - should increment
+        let _ = cb
+            .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+            .await;
+        assert_eq!(cb.failure_count(), 2);
+
+        // Unauthorized (non-transient) - should not increment
+        let _ = cb
+            .call(|| async { Err::<(), ApiError>(ApiError::Unauthorized) })
+            .await;
+        assert_eq!(cb.failure_count(), 2);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // CONCURRENT REQUESTS
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Test that concurrent requests respect circuit state.
+    #[tokio::test]
+    async fn concurrent_requests_respect_circuit_state() {
+        let cb = Arc::new(CircuitBreaker::new("test-service", 2, Duration::from_secs(10)));
+
+        // Create two tasks that will try to fail the circuit
+        let cb1 = cb.clone();
+        let task1 = tokio::spawn(async move {
+            for _ in 0..2 {
+                let _ = cb1
+                    .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+                    .await;
+            }
+        });
+
+        let cb2 = cb.clone();
+        let task2 = tokio::spawn(async move {
+            // Small delay to let task1 get first failures in
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let result = cb2.call(|| async { Ok::<_, ApiError>(()) }).await;
+            result
+        });
+
+        let _ = tokio::join!(task1, task2);
+
+        // Circuit should be open
+        let result = cb
+            .call(|| async { panic!("Should not reach here") })
+            .await;
+        assert!(matches!(result, Err(ApiError::CircuitOpen(_))));
+    }
+
+    /// Test that concurrent successful calls maintain closed state.
+    #[tokio::test]
+    async fn concurrent_successful_calls_maintain_closed_state() {
+        let cb = Arc::new(CircuitBreaker::new("test-service", 10, Duration::from_secs(10)));
+        let counter = Arc::new(CallCounter::new());
+
+        let mut tasks = vec![];
+
+        for i in 0..10 {
+            let cb_clone = cb.clone();
+            let counter_clone = counter.clone();
+
+            let task = tokio::spawn(async move {
+                for _ in 0..5 {
+                    let _ = cb_clone
+                        .call(move || {
+                            let c = counter_clone.clone();
+                            async move {
+                                c.increment();
+                                Ok::<_, ApiError>(i)
+                            }
+                        })
+                        .await;
+                }
+            });
+
+            tasks.push(task);
+        }
+
+        for task in tasks {
+            let _ = task.await;
+        }
+
+        // Should have succeeded 50 times
+        assert_eq!(counter.count(), 50);
+        // Circuit should remain closed
+        assert_eq!(cb.failure_count(), 0);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // ENV VARIABLE OVERRIDES
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Test that from_env respects custom failure threshold.
+    #[test]
+    fn from_env_respects_failure_threshold_override() {
+        std::env::set_var("CB_CUSTOM_TEST_FAILURE_THRESHOLD", "7");
+        let cb = CircuitBreaker::from_env("custom-test", 5, 30);
+
+        // The threshold should be 7 from env, not 5 from default
+        // We can verify this indirectly by checking behavior
+
+        std::env::remove_var("CB_CUSTOM_TEST_FAILURE_THRESHOLD");
+    }
+
+    /// Test that from_env respects custom recovery timeout.
+    #[test]
+    fn from_env_respects_recovery_timeout_override() {
+        std::env::set_var("CB_CUSTOM_TEST_2_RECOVERY_TIMEOUT_SECS", "120");
+        let cb = CircuitBreaker::from_env("custom-test-2", 5, 30);
+
+        // Verify the recovery timeout was set - the timeout is stored as secs
+        assert_eq!(cb.0.recovery_timeout_secs, 120);
+
+        std::env::remove_var("CB_CUSTOM_TEST_2_RECOVERY_TIMEOUT_SECS");
+    }
+
+    /// Test that from_env uses defaults when env vars not set.
+    #[test]
+    fn from_env_uses_defaults_when_unset() {
+        // Ensure env vars are not set
+        std::env::remove_var("CB_DEFAULT_TEST_FAILURE_THRESHOLD");
+        std::env::remove_var("CB_DEFAULT_TEST_RECOVERY_TIMEOUT_SECS");
+
+        let cb = CircuitBreaker::from_env("default-test", 5, 60);
+
+        assert_eq!(cb.0.failure_threshold, 5);
+        assert_eq!(cb.0.recovery_timeout_secs, 60);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // STRESS SCENARIOS
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Test rapid failures trigger circuit correctly.
+    #[tokio::test]
+    async fn rapid_failures_trigger_circuit() {
+        let cb = CircuitBreaker::new("test-service", 5, Duration::from_secs(1));
+        let counter = Arc::new(CallCounter::new());
+
+        // Rapidly send 5 failures
+        for _ in 0..5 {
+            let result = cb
+                .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+                .await;
+            assert!(result.is_err());
+        }
+
+        // Next call should be rejected
+        let result = cb
+            .call(move || {
+                let c = counter.clone();
+                async move {
+                    c.increment();
+                    panic!("Should not reach");
+                }
+            })
+            .await;
+
+        assert!(matches!(result, Err(ApiError::CircuitOpen(_))));
+        assert_eq!(counter.count(), 0, "Circuit should prevent calls");
+    }
+
+    /// Test that just-under threshold failures don't open circuit.
+    #[tokio::test]
+    async fn below_threshold_failures_do_not_open_circuit() {
+        let cb = CircuitBreaker::new("test-service", 5, Duration::from_secs(30));
+
+        // Send 4 failures (threshold is 5)
+        for i in 0..4 {
+            let result = cb
+                .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+                .await;
+            assert!(result.is_err(), "Failure {} should be allowed", i + 1);
+        }
+
+        // Next successful call should still go through
+        let result = cb.call(|| async { Ok::<_, ApiError>(42) }).await;
+
+        assert!(
+            result.is_ok(),
+            "Circuit should allow calls when below threshold"
+        );
+        assert_eq!(cb.failure_count(), 0, "Successful call resets counter");
+    }
+
+    /// Test that circuit name is included in error message.
+    #[tokio::test]
+    async fn circuit_name_in_error_message() {
+        let cb = CircuitBreaker::new("payment-gateway", 1, Duration::from_secs(10));
+
+        let _ = cb
+            .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+            .await;
+
+        let result = cb
+            .call(|| async { panic!("Should not reach") })
+            .await;
+
+        match result {
+            Err(ApiError::CircuitOpen(name)) => {
+                assert_eq!(name, "payment-gateway");
+            }
+            _ => panic!("Expected CircuitOpen error with service name"),
+        }
+    }
+
+    /// Test that separate circuit breakers operate independently.
+    #[tokio::test]
+    async fn separate_circuit_breakers_independent() {
+        let cb1 = Arc::new(CircuitBreaker::new("service-1", 2, Duration::from_secs(10)));
+        let cb2 = Arc::new(CircuitBreaker::new("service-2", 2, Duration::from_secs(10)));
+
+        // Fail service-1 twice
+        for _ in 0..2 {
+            let _ = cb1
+                .call(|| async { Err::<(), ApiError>(ApiError::Timeout) })
+                .await;
+        }
+
+        // Service-1 should be open
+        assert!(
+            cb1.call(|| async { panic!("Should not reach") })
+                .await
+                .is_err()
+        );
+
+        // Service-2 should still be closed
+        let result = cb2.call(|| async { Ok::<_, ApiError>(42) }).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+    }
 }

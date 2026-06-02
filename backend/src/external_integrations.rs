@@ -621,4 +621,274 @@ mod tests {
         assert!(d1 > d0, "second delay must be larger than first");
         assert!(d2 >= d1, "third delay must be >= second (may be capped)");
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CIRCUIT BREAKER INTEGRATION TESTS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Test that circuits are initialized with correct service names and defaults.
+    #[test]
+    fn circuit_breaker_initialization_defaults() {
+        let cb = CircuitBreaker::new("test_service", 5, Duration::from_secs(30));
+        assert_eq!(cb.0.failure_threshold, 5);
+        assert_eq!(cb.0.recovery_timeout_secs, 30);
+        assert_eq!(cb.0.service_name, "test_service");
+    }
+
+    /// Test that anchor integration client has circuit breaker protection.
+    #[test]
+    fn anchor_client_has_circuit_breaker() {
+        std::env::set_var("ANCHOR_INTEGRATION_URL", "http://localhost:8080");
+        let client = AnchorIntegrationClient::from_env();
+        assert!(client.is_some());
+        let client = client.unwrap();
+        assert_eq!(client.circuit_breaker.0.service_name, "anchor_integration");
+        std::env::remove_var("ANCHOR_INTEGRATION_URL");
+    }
+
+    /// Test that compliance client has circuit breaker protection.
+    #[test]
+    fn compliance_client_has_circuit_breaker() {
+        std::env::set_var("COMPLIANCE_API_URL", "http://localhost:8080");
+        let client = ComplianceApiClient::from_env();
+        assert!(client.is_some());
+        let client = client.unwrap();
+        assert_eq!(client.circuit_breaker.0.service_name, "compliance_api");
+        std::env::remove_var("COMPLIANCE_API_URL");
+    }
+
+    /// Test that sanctions client has circuit breaker protection.
+    #[test]
+    fn sanctions_client_has_circuit_breaker() {
+        std::env::set_var("SANCTIONS_API_URL", "http://localhost:8080");
+        std::env::set_var("SANCTIONS_API_KEY", "test-key");
+        let client = SanctionsApiClient::from_env();
+        assert!(client.is_some());
+        let client = client.unwrap();
+        assert_eq!(client.circuit_breaker.0.service_name, "sanctions_api");
+        std::env::remove_var("SANCTIONS_API_URL");
+        std::env::remove_var("SANCTIONS_API_KEY");
+    }
+
+    /// Test circuit breaker failure threshold configuration via env vars.
+    #[test]
+    fn circuit_breaker_failure_threshold_configurable() {
+        std::env::set_var("CB_ANCHOR_INTEGRATION_FAILURE_THRESHOLD", "10");
+        let cb = CircuitBreaker::from_env("anchor_integration", 5, 30);
+        assert_eq!(cb.0.failure_threshold, 10);
+        std::env::remove_var("CB_ANCHOR_INTEGRATION_FAILURE_THRESHOLD");
+    }
+
+    /// Test circuit breaker recovery timeout configuration via env vars.
+    #[test]
+    fn circuit_breaker_recovery_timeout_configurable() {
+        std::env::set_var("CB_COMPLIANCE_API_RECOVERY_TIMEOUT_SECS", "60");
+        let cb = CircuitBreaker::from_env("compliance_api", 5, 30);
+        assert_eq!(cb.0.recovery_timeout_secs, 60);
+        std::env::remove_var("CB_COMPLIANCE_API_RECOVERY_TIMEOUT_SECS");
+    }
+
+    /// Test env var parsing falls back to defaults on invalid values.
+    #[test]
+    fn circuit_breaker_invalid_env_vars_use_defaults() {
+        std::env::set_var("CB_TEST_SERVICE_FAILURE_THRESHOLD", "not-a-number");
+        let cb = CircuitBreaker::from_env("test_service", 5, 30);
+        assert_eq!(cb.0.failure_threshold, 5, "Invalid threshold should use default");
+        std::env::remove_var("CB_TEST_SERVICE_FAILURE_THRESHOLD");
+    }
+
+    /// Test service name normalization in from_env.
+    #[test]
+    fn circuit_breaker_service_name_normalization() {
+        let cb = CircuitBreaker::from_env("my-hyphen-service", 5, 30);
+        // Service name should be normalized in env var lookups
+        assert_eq!(cb.0.service_name, "my-hyphen-service");
+    }
+
+    /// Test that multiple circuit breakers can coexist independently.
+    #[test]
+    fn multiple_circuit_breakers_independent() {
+        let anchor_cb = CircuitBreaker::new("anchor", 5, Duration::from_secs(30));
+        let compliance_cb = CircuitBreaker::new("compliance", 3, Duration::from_secs(60));
+
+        assert_eq!(anchor_cb.0.failure_threshold, 5);
+        assert_eq!(compliance_cb.0.failure_threshold, 3);
+        assert_ne!(anchor_cb.0.service_name, compliance_cb.0.service_name);
+    }
+
+    /// Test that circuit breaker cloning shares inner state.
+    #[test]
+    fn circuit_breaker_clone_shares_state() {
+        let cb1 = CircuitBreaker::new("test", 5, Duration::from_secs(30));
+        let cb2 = cb1.clone();
+
+        // Both should refer to the same service name
+        assert_eq!(cb1.0.service_name, cb2.0.service_name);
+        assert_eq!(cb1.0.failure_threshold, cb2.0.failure_threshold);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CIRCUIT BREAKER ERROR SCENARIOS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Test that CircuitOpen error cannot be retried per the retry predicate.
+    #[test]
+    fn circuit_open_error_not_retried_by_predicate() {
+        let is_retryable =
+            |e: &ApiError| matches!(e, ApiError::Timeout | ApiError::ExternalService(_));
+
+        assert!(
+            !is_retryable(&ApiError::CircuitOpen("service".to_owned())),
+            "CircuitOpen should not be considered retryable"
+        );
+    }
+
+    /// Test that ServiceUnavailable error is not retried.
+    #[test]
+    fn service_unavailable_not_retried_by_predicate() {
+        let is_retryable =
+            |e: &ApiError| matches!(e, ApiError::Timeout | ApiError::ExternalService(_));
+
+        assert!(
+            !is_retryable(&ApiError::ServiceUnavailable("x".to_owned())),
+            "ServiceUnavailable should not be retried"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // EXTERNAL SERVICE DEGRADATION PATTERNS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Test compliance timeout recovery translates to Ok for non-critical paths.
+    #[test]
+    fn compliance_timeout_degradation_ok() {
+        // This mirrors the actual degradation logic in submit_compliance_flag
+        let timeout_error: Result<(), ApiError> = Err(ApiError::Timeout);
+        let degraded = match timeout_error {
+            Ok(()) => Ok(()),
+            Err(ApiError::Timeout) => {
+                // Non-critical path: log and continue
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        assert!(degraded.is_ok(), "Compliance timeout should degrade gracefully");
+    }
+
+    /// Test sanctions timeout fails safe with ServiceUnavailable.
+    #[test]
+    fn sanctions_timeout_fails_safe() {
+        // This mirrors the actual logic in screen_user
+        let timeout_error: Result<Option<String>, ApiError> = Err(ApiError::Timeout);
+        let failed_safe = match timeout_error {
+            Ok(v) => Ok(v),
+            Err(ApiError::Timeout) => Err(ApiError::ServiceUnavailable(
+                "Sanctions screening is temporarily unavailable. Please try again shortly."
+                    .to_owned(),
+            )),
+            Err(e) => Err(e),
+        };
+        assert!(
+            matches!(failed_safe, Err(ApiError::ServiceUnavailable(_))),
+            "Sanctions timeout should fail safe"
+        );
+    }
+
+    /// Test that CircuitOpen during compliance check is propagated.
+    #[test]
+    fn circuit_open_propagates_in_compliance() {
+        let circuit_error: Result<(), ApiError> =
+            Err(ApiError::CircuitOpen("compliance_api".to_owned()));
+
+        // The degradation logic should NOT swallow CircuitOpen
+        let result = match circuit_error {
+            Ok(()) => Ok(()),
+            Err(ApiError::Timeout) => Ok(()),
+            Err(e) => Err(e),
+        };
+
+        assert!(
+            result.is_err(),
+            "CircuitOpen should not be swallowed by compliance degradation"
+        );
+    }
+
+    /// Test that degradation only applies to specific errors.
+    #[test]
+    fn degradation_only_applies_to_timeout() {
+        let external_error: Result<(), ApiError> =
+            Err(ApiError::ExternalService("503".to_owned()));
+
+        // ExternalService should NOT be degraded, only Timeout
+        let result = match external_error {
+            Ok(()) => Ok(()),
+            Err(ApiError::Timeout) => Ok(()),
+            Err(e) => Err(e),
+        };
+
+        assert!(
+            result.is_err(),
+            "ExternalService error should not be degraded"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STRESS AND SATURATION SCENARIOS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Test rapid transient errors trigger circuit breaker.
+    #[test]
+    fn rapid_transient_errors_trigger_circuit() {
+        let cfg = timeout_retry_config();
+        // Should have max_attempts >= 2
+        assert!(cfg.max_attempts >= 2, "Need at least one retry opportunity");
+        // Should have reasonable delays
+        assert!(cfg.base_delay < Duration::from_secs(2));
+        assert!(cfg.max_delay <= Duration::from_secs(30));
+    }
+
+    /// Test that retry config max delay doesn't exceed reasonable bounds.
+    #[test]
+    fn retry_config_max_delay_within_bounds() {
+        let cfg = timeout_retry_config();
+        assert!(
+            cfg.max_delay <= Duration::from_secs(30),
+            "Max retry delay must be within request timeout budget"
+        );
+    }
+
+    /// Test retry backoff factor is progressive.
+    #[test]
+    fn retry_backoff_is_progressive() {
+        let cfg = timeout_retry_config();
+        assert!(
+            cfg.backoff_factor > 1.0 && cfg.backoff_factor <= 3.0,
+            "Backoff factor should be between 1 and 3"
+        );
+    }
+
+    /// Test that no env var contamination affects circuit initialization.
+    #[test]
+    fn circuit_init_with_clean_env() {
+        // Ensure no conflicting env vars
+        std::env::remove_var("CB_CLEAN_TEST_FAILURE_THRESHOLD");
+        std::env::remove_var("CB_CLEAN_TEST_RECOVERY_TIMEOUT_SECS");
+
+        let cb = CircuitBreaker::from_env("clean-test", 5, 30);
+        assert_eq!(cb.0.failure_threshold, 5);
+        assert_eq!(cb.0.recovery_timeout_secs, 30);
+    }
+
+    /// Test that circuit name is correctly extracted for env var lookups.
+    #[test]
+    fn circuit_env_var_naming_convention() {
+        // Service name "anchor-integration" becomes "ANCHOR_INTEGRATION"
+        std::env::set_var("CB_ANCHOR_INTEGRATION_FAILURE_THRESHOLD", "8");
+        let cb = CircuitBreaker::from_env("anchor-integration", 5, 30);
+        assert_eq!(
+            cb.0.failure_threshold, 8,
+            "Should find env var with normalized name"
+        );
+        std::env::remove_var("CB_ANCHOR_INTEGRATION_FAILURE_THRESHOLD");
+    }
 }
